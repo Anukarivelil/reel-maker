@@ -1,0 +1,583 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Create project files
+        run: |
+          mkdir -p app/lib && cd app
+          cat > pubspec.yaml <<'EOF_0'
+          name: reel_maker
+          description: Offline auto reel maker - cleans, enhances and joins video clips.
+          publish_to: "none"
+          version: 1.0.0+1
+
+          environment:
+            sdk: ">=3.3.0 <4.0.0"
+
+          dependencies:
+            flutter:
+              sdk: flutter
+            image_picker: any
+            ffmpeg_kit_flutter_new: any
+            image: any
+            path_provider: any
+            gal: any
+            video_player: any
+
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+
+          flutter:
+            uses-material-design: true
+          EOF_0
+          cat > lib/analyzer.dart <<'EOF_1'
+          import 'dart:io';
+
+          import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+          import 'package:ffmpeg_kit_flutter_new/ffprobe_kit.dart';
+          import 'package:ffmpeg_kit_flutter_new/return_code.dart';
+          import 'package:flutter/foundation.dart';
+          import 'package:image/image.dart' as img;
+
+          /// A good (sharp, well-exposed) piece of a clip.
+          class Segment {
+            final String clip;
+            final double start;
+            final double duration;
+            final double score; // sharpness relative to the clip's median
+            final double brightness; // 0..255 average luminance
+            final bool hasAudio;
+
+            const Segment({
+              required this.clip,
+              required this.start,
+              required this.duration,
+              required this.score,
+              required this.brightness,
+              required this.hasAudio,
+            });
+          }
+
+          /// Seconds of video represented by one analysed frame.
+          const double _step = 0.5; // frames sampled at 2 fps
+          const double _minSegment = 1.0; // drop good runs shorter than this
+          const double _maxSegment = 6.0; // keep reels punchy
+          const double _fallbackLen = 3.0; // used when nothing in a clip is "good"
+
+          /// Runs in a background isolate: [laplacian variance, mean luminance].
+          List<double> _frameStats(String path) {
+            final im = img.decodeJpg(File(path).readAsBytesSync());
+            if (im == null) return [0, 0];
+            final w = im.width, h = im.height;
+            final g = List<double>.filled(w * h, 0);
+            double sum = 0;
+            for (var y = 0; y < h; y++) {
+              for (var x = 0; x < w; x++) {
+                final l = im.getPixel(x, y).luminanceNormalized.toDouble() * 255;
+                g[y * w + x] = l;
+                sum += l;
+              }
+            }
+            double s = 0, s2 = 0;
+            var n = 0;
+            for (var y = 1; y < h - 1; y++) {
+              for (var x = 1; x < w - 1; x++) {
+                final c = y * w + x;
+                final lap = 4 * g[c] - g[c - 1] - g[c + 1] - g[c - w] - g[c + w];
+                s += lap;
+                s2 += lap * lap;
+                n++;
+              }
+            }
+            final variance = n == 0 ? 0.0 : s2 / n - (s / n) * (s / n);
+            return [variance, sum / (w * h)];
+          }
+
+          List<List<double>> _statsBatch(List<String> paths) =>
+              paths.map(_frameStats).toList();
+
+          Future<double> probeDuration(String path) async {
+            final s = await FFprobeKit.getMediaInformation(path);
+            final d = s.getMediaInformation()?.getDuration();
+            return double.tryParse(d ?? '') ?? 0;
+          }
+
+          Future<bool> probeHasAudio(String path) async {
+            final s = await FFprobeKit.getMediaInformation(path);
+            final streams = s.getMediaInformation()?.getStreams() ?? [];
+            return streams.any((st) => st.getType() == 'audio');
+          }
+
+          double _median(List<double> v) {
+            final s = [...v]..sort();
+            return s.isEmpty ? 0 : s[s.length ~/ 2];
+          }
+
+          /// Picks the [len]-second window in frames [a]..[b] with the best sharpness.
+          (double, double) _bestWindow(
+              List<double> sharp, int a, int b, double len, double dur) {
+            final runSeconds = (b - a + 1) * _step;
+            if (runSeconds <= len) {
+              return (a * _step, (runSeconds).clamp(0, dur - a * _step).toDouble());
+            }
+            final frames = (len / _step).round();
+            var bestStart = a;
+            var bestSum = -1.0;
+            for (var i = a; i + frames - 1 <= b; i++) {
+              var sum = 0.0;
+              for (var k = 0; k < frames; k++) {
+                sum += sharp[i + k];
+              }
+              if (sum > bestSum) {
+                bestSum = sum;
+                bestStart = i;
+              }
+            }
+            return (bestStart * _step, len);
+          }
+
+          /// Finds the usable parts of one clip: removes blurry, too-dark and
+          /// blown-out stretches.
+          Future<List<Segment>> analyzeClip(String clip, Directory work, int index) async {
+            final dur = await probeDuration(clip);
+            final audio = await probeHasAudio(clip);
+            if (dur <= 0) return [];
+
+            final dir = Directory('${work.path}/frames_$index')..createSync(recursive: true);
+            final session = await FFmpegKit.executeWithArguments([
+              '-y', '-i', clip,
+              '-vf', 'fps=${1 / _step},scale=160:-2',
+              '-q:v', '3',
+              '${dir.path}/f_%04d.jpg',
+            ]);
+            if (!ReturnCode.isSuccess(await session.getReturnCode())) return [];
+
+            final files = dir.listSync().whereType<File>().map((f) => f.path).toList()
+              ..sort();
+            if (files.isEmpty) return [];
+            final stats = await compute(_statsBatch, files);
+            final sharp = stats.map((s) => s[0]).toList();
+            final lum = stats.map((s) => s[1]).toList();
+            dir.deleteSync(recursive: true);
+
+            final med = _median(sharp);
+            final thr = med * 0.4 < 25 ? 25.0 : med * 0.4;
+            final n = sharp.length;
+            final good = List<bool>.generate(
+                n, (i) => sharp[i] >= thr && lum[i] > 30 && lum[i] < 238);
+            // Heal one-frame glitches so cuts don't get choppy.
+            for (var i = 1; i < n - 1; i++) {
+              if (!good[i] && good[i - 1] && good[i + 1]) good[i] = true;
+            }
+
+            double meanLum(int a, int b) =>
+                lum.sublist(a, b + 1).reduce((x, y) => x + y) / (b - a + 1);
+            double scoreOf(int a, int b) => med <= 0
+                ? 1
+                : (sharp.sublist(a, b + 1).reduce((x, y) => x + y) / (b - a + 1)) / med;
+
+            Segment build(int a, int b, double len) {
+              final (start, d) = _bestWindow(sharp, a, b, len, dur);
+              return Segment(
+                clip: clip,
+                start: start,
+                duration: d,
+                score: scoreOf(a, b),
+                brightness: meanLum(a, b),
+                hasAudio: audio,
+              );
+            }
+
+            final out = <Segment>[];
+            var i = 0;
+            while (i < n) {
+              if (!good[i]) {
+                i++;
+                continue;
+              }
+              var j = i;
+              while (j + 1 < n && good[j + 1]) {
+                j++;
+              }
+              if ((j - i + 1) * _step >= _minSegment) {
+                out.add(build(i, j, _maxSegment));
+              }
+              i = j + 1;
+            }
+
+            if (out.isEmpty) {
+              // Nothing passed the filters: keep the best stretch so the clip isn't lost.
+              out.add(build(0, n - 1, _fallbackLen));
+            }
+            return out.where((s) => s.duration >= 0.8).toList();
+          }
+          EOF_1
+          cat > lib/reel_maker.dart <<'EOF_2'
+          import 'dart:io';
+
+          import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
+          import 'package:ffmpeg_kit_flutter_new/return_code.dart';
+          import 'package:path_provider/path_provider.dart';
+
+          import 'analyzer.dart';
+
+          typedef Progress = void Function(String message, double fraction);
+
+          /// Reel settings. Tweak freely.
+          const int outW = 1080;
+          const int outH = 1920; // 9:16 for Reels / Shorts
+          const int fps = 30;
+          const double transitionSecs = 0.5;
+          const double maxReelSecs = 60; // longest reel allowed
+
+          const _transitions = [
+            'fade',
+            'slideleft',
+            'circleopen',
+            'wipeleft',
+            'smoothleft',
+            'dissolve',
+            'zoomin',
+            'slideup',
+          ];
+
+          class ReelMaker {
+            bool _useHardwareEncoder = false;
+
+            List<String> _videoEncoder() => _useHardwareEncoder
+                ? ['-c:v', 'h264_mediacodec', '-b:v', '8M']
+                : ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20'];
+
+            /// Runs ffmpeg; if the software encoder is missing, retries once with
+            /// Android's hardware H.264 encoder.
+            Future<bool> _run(List<String> Function() args) async {
+              var s = await FFmpegKit.executeWithArguments(args());
+              if (ReturnCode.isSuccess(await s.getReturnCode())) return true;
+              if (!_useHardwareEncoder) {
+                _useHardwareEncoder = true;
+                s = await FFmpegKit.executeWithArguments(args());
+                return ReturnCode.isSuccess(await s.getReturnCode());
+              }
+              return false;
+            }
+
+            /// Full pipeline. Returns the path of the finished reel.
+            Future<String> make(List<String> clips, Progress onProgress) async {
+              final tmp = await getTemporaryDirectory();
+              final work = Directory('${tmp.path}/reel_work')..createSync(recursive: true);
+              for (final f in work.listSync()) {
+                f.deleteSync(recursive: true);
+              }
+
+              // 1) Find the good parts of every clip.
+              var segments = <Segment>[];
+              for (var i = 0; i < clips.length; i++) {
+                onProgress('Analysing clip ${i + 1} of ${clips.length}…',
+                    0.05 + 0.25 * i / clips.length);
+                segments.addAll(await analyzeClip(clips[i], work, i));
+              }
+              if (segments.isEmpty) {
+                throw Exception('No usable video found in the selected clips.');
+              }
+
+              // 2) Respect the max reel length: drop the weakest segments first.
+              double total(List<Segment> l) => l.fold(0.0, (a, s) => a + s.duration);
+              final ranked = [...segments]..sort((a, b) => a.score.compareTo(b.score));
+              while (total(segments) > maxReelSecs && segments.length > 1) {
+                segments.remove(ranked.removeAt(0));
+              }
+
+              // 3) Match lighting across clips: pull each segment toward the shared average.
+              final target =
+                  segments.fold(0.0, (a, s) => a + s.brightness) / segments.length;
+
+              // 4) Re-encode each segment to the same size/fps with colour enhancement.
+              final parts = <String>[];
+              final durations = <double>[];
+              for (var i = 0; i < segments.length; i++) {
+                onProgress('Enhancing part ${i + 1} of ${segments.length}…',
+                    0.30 + 0.45 * i / segments.length);
+                final s = segments[i];
+                final out = '${work.path}/part_$i.mp4';
+                final gain = ((target - s.brightness) / 255 * 0.5).clamp(-0.12, 0.12);
+                final vf = 'scale=$outW:$outH:force_original_aspect_ratio=increase,'
+                    'crop=$outW:$outH,setsar=1,fps=$fps,'
+                    'eq=brightness=${gain.toStringAsFixed(3)}:contrast=1.08:saturation=1.18,'
+                    'unsharp=5:5:0.5:5:5:0.0,format=yuv420p';
+                final d = s.duration.toStringAsFixed(3);
+                final fadeOut = (s.duration - 0.05).toStringAsFixed(3);
+                final af = 'aresample=44100,aformat=channel_layouts=stereo,'
+                    'afade=t=in:d=0.05,afade=t=out:st=$fadeOut:d=0.05';
+
+                final ok = await _run(() => [
+                      '-y',
+                      '-ss', s.start.toStringAsFixed(3), '-t', d, '-i', s.clip,
+                      if (!s.hasAudio) ...[
+                        '-f', 'lavfi', '-t', d, '-i', 'anullsrc=r=44100:cl=stereo',
+                      ],
+                      '-vf', vf,
+                      if (s.hasAudio) ...['-af', af],
+                      if (!s.hasAudio) ...['-map', '0:v', '-map', '1:a', '-shortest'],
+                      ..._videoEncoder(),
+                      '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
+                      out,
+                    ]);
+                if (!ok) throw Exception('Could not process part ${i + 1}.');
+                parts.add(out);
+                durations.add(await probeDuration(out));
+              }
+
+              // 5) Join with transitions.
+              final reel = '${tmp.path}/reel_${DateTime.now().millisecondsSinceEpoch}.mp4';
+              onProgress('Adding transitions…', 0.80);
+              if (parts.length == 1) {
+                await File(parts.first).copy(reel);
+              } else {
+                final v = StringBuffer(), a = StringBuffer();
+                var merged = durations[0]; // length of everything joined so far
+                var vPrev = '0:v', aPrev = '0:a';
+                for (var i = 1; i < parts.length; i++) {
+                  final t = transitionSecs;
+                  final offset = (merged - t).toStringAsFixed(3);
+                  final vOut = i == parts.length - 1 ? 'vout' : 'v$i';
+                  final aOut = i == parts.length - 1 ? 'aout' : 'a$i';
+                  final name = _transitions[(i - 1) % _transitions.length];
+                  v.write('[$vPrev][$i:v]xfade=transition=$name:duration=$t:offset=$offset[$vOut];');
+                  a.write('[$aPrev][$i:a]acrossfade=d=$t[$aOut];');
+                  vPrev = vOut;
+                  aPrev = aOut;
+                  merged += durations[i] - t;
+                }
+                final filter = '$v${a.toString().replaceFirst(RegExp(r';$'), '')}';
+                final ok = await _run(() => [
+                      '-y',
+                      for (final p in parts) ...['-i', p],
+                      '-filter_complex', filter,
+                      '-map', '[vout]', '-map', '[aout]',
+                      ..._videoEncoder(),
+                      '-pix_fmt', 'yuv420p',
+                      '-c:a', 'aac', '-b:a', '160k',
+                      '-movflags', '+faststart',
+                      reel,
+                    ]);
+                if (!ok) throw Exception('Could not join the clips.');
+              }
+
+              onProgress('Done', 1.0);
+              work.deleteSync(recursive: true);
+              return reel;
+            }
+          }
+          EOF_2
+          cat > lib/main.dart <<'EOF_3'
+          import 'dart:io';
+
+          import 'package:flutter/material.dart';
+          import 'package:gal/gal.dart';
+          import 'package:image_picker/image_picker.dart';
+          import 'package:video_player/video_player.dart';
+
+          import 'reel_maker.dart';
+
+          const int maxClips = 20;
+
+          void main() => runApp(const ReelApp());
+
+          class ReelApp extends StatelessWidget {
+            const ReelApp({super.key});
+
+            @override
+            Widget build(BuildContext context) => MaterialApp(
+                  title: 'Reel Maker',
+                  debugShowCheckedModeBanner: false,
+                  theme: ThemeData(
+                    colorSchemeSeed: Colors.deepPurple,
+                    brightness: Brightness.dark,
+                    useMaterial3: true,
+                  ),
+                  home: const Home(),
+                );
+          }
+
+          class Home extends StatefulWidget {
+            const Home({super.key});
+
+            @override
+            State<Home> createState() => _HomeState();
+          }
+
+          class _HomeState extends State<Home> {
+            final clips = <String>[];
+            bool busy = false;
+            String status = '';
+            double progress = 0;
+            String? output;
+            VideoPlayerController? player;
+
+            Future<void> pick() async {
+              final files = await ImagePicker().pickMultiVideo();
+              if (files.isEmpty) return;
+              setState(() {
+                for (final f in files) {
+                  if (clips.length < maxClips && !clips.contains(f.path)) {
+                    clips.add(f.path);
+                  }
+                }
+              });
+            }
+
+            Future<void> make() async {
+              setState(() {
+                busy = true;
+                output = null;
+                progress = 0;
+              });
+              await player?.dispose();
+              player = null;
+              try {
+                final path = await ReelMaker().make(clips, (m, f) {
+                  if (mounted) setState(() {
+                    status = m;
+                    progress = f;
+                  });
+                });
+                setState(() => status = 'Saving to gallery…');
+                await Gal.putVideo(path);
+                final c = VideoPlayerController.file(File(path));
+                await c.initialize();
+                c.setLooping(true);
+                c.play();
+                setState(() {
+                  output = path;
+                  player = c;
+                  status = 'Saved to your gallery ✔';
+                });
+              } catch (e) {
+                setState(() => status = 'Error: $e');
+              } finally {
+                setState(() => busy = false);
+              }
+            }
+
+            @override
+            void dispose() {
+              player?.dispose();
+              super.dispose();
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('Reel Maker')),
+                body: Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      Row(children: [
+                        Expanded(
+                          child: FilledButton.tonalIcon(
+                            onPressed: busy ? null : pick,
+                            icon: const Icon(Icons.video_library),
+                            label: Text('Add clips (${clips.length}/$maxClips)'),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: FilledButton.icon(
+                            onPressed: busy || clips.isEmpty ? null : make,
+                            icon: const Icon(Icons.auto_awesome),
+                            label: const Text('Make reel'),
+                          ),
+                        ),
+                      ]),
+                      const SizedBox(height: 12),
+                      if (busy) LinearProgressIndicator(value: progress),
+                      if (status.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 8),
+                          child: Text(status),
+                        ),
+                      if (player != null && output != null)
+                        Expanded(
+                          child: Center(
+                            child: AspectRatio(
+                              aspectRatio: player!.value.aspectRatio,
+                              child: VideoPlayer(player!),
+                            ),
+                          ),
+                        )
+                      else
+                        Expanded(
+                          child: clips.isEmpty
+                              ? const Center(
+                                  child: Text('Add any number of clips to start.'))
+                              : ReorderableListView(
+                                  onReorder: busy
+                                      ? (_, __) {}
+                                      : (a, b) => setState(() {
+                                            if (b > a) b--;
+                                            clips.insert(b, clips.removeAt(a));
+                                          }),
+                                  children: [
+                                    for (final c in clips)
+                                      ListTile(
+                                        key: ValueKey(c),
+                                        leading: const Icon(Icons.movie),
+                                        title: Text(c.split('/').last,
+                                            overflow: TextOverflow.ellipsis),
+                                        trailing: IconButton(
+                                          icon: const Icon(Icons.close),
+                                          onPressed: busy
+                                              ? null
+                                              : () => setState(() => clips.remove(c)),
+                                        ),
+                                      ),
+                                  ],
+                                ),
+                        ),
+                    ],
+                  ),
+                ),
+              );
+            }
+          }
+          EOF_3
+          cat > setup.sh <<'EOF_4'
+          #!/usr/bin/env bash
+          # Run once, from inside the reel_maker folder, on a computer with Flutter installed.
+          set -e
+          flutter create --org com.local --project-name reel_maker --platforms android .
+
+          # ffmpeg-kit needs Android minSdk 24+
+          for f in android/app/build.gradle.kts android/app/build.gradle; do
+            [ -f "$f" ] && sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' "$f"
+          done
+
+          # Allow saving to the gallery on Android 9 and below
+          M=android/app/src/main/AndroidManifest.xml
+          grep -q WRITE_EXTERNAL_STORAGE "$M" || sed -i 's#<application#<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>\n    <application#' "$M"
+
+          flutter pub get
+          echo "Done. Connect your phone (USB debugging on) and run: flutter run --release"
+          EOF_4
+      - name: Build
+        working-directory: app
+        run: |
+          bash setup.sh
+          flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reel-maker-apk
+          path: app/build/app/outputs/flutter-apk/app-release.apk
+
