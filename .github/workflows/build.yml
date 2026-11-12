@@ -564,6 +564,13 @@ jobs:
             [ -f "$f" ] && sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 24/; s/minSdkVersion flutter.minSdkVersion/minSdkVersion 24/' "$f"
           done
 
+          # Turn off the release lint check, which crashes on some plugin combinations
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i '0,/^android {/s//android {\n    lint {\n        checkReleaseBuilds = false\n        abortOnError = false\n    }/' android/app/build.gradle.kts
+          elif [ -f android/app/build.gradle ]; then
+            sed -i '0,/^android {/s//android {\n    lint {\n        checkReleaseBuilds false\n        abortOnError false\n    }/' android/app/build.gradle
+          fi
+
           # Allow saving to the gallery on Android 9 and below
           M=android/app/src/main/AndroidManifest.xml
           grep -q WRITE_EXTERNAL_STORAGE "$M" || sed -i 's#<application#<uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28"/>\n    <application#' "$M"
