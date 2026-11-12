@@ -222,14 +222,118 @@ jobs:
             return out.where((s) => s.duration >= 0.8).toList();
           }
           EOF_1
-          cat > lib/reel_maker.dart <<'EOF_2'
+          cat > lib/text_overlay.dart <<'EOF_2'
           import 'dart:io';
+          import 'dart:math';
+          import 'dart:ui' as ui;
+
+          import 'package:flutter/material.dart';
+
+          /// Layout is done in the 1080x1920 output space.
+          const double kW = 1080;
+          const double kH = 1920;
+          const double kTitleSize = 72;
+          const double kCaptionSize = 44;
+          const double kTextMaxW = 880;
+          const double kGap = 18;
+          const double kPad = 20; // room for the text shadow around each image
+
+          /// What the user chose: texts plus one shared on-screen position.
+          class OverlayOptions {
+            final List<String> titles;
+            final List<String> captions;
+
+            /// Horizontal centre and top of the block, as fractions of the frame.
+            final double ax, ay;
+
+            const OverlayOptions(this.titles, this.captions, this.ax, this.ay);
+
+            bool get isEmpty => titles.isEmpty && captions.isEmpty;
+          }
+
+          /// One piece of text, placed in output pixels.
+          class OverlayItem {
+            final String text;
+            final bool title;
+            final int index; // position within its own list
+            final Size size; // image size incl. padding
+            final Offset pos; // top-left of the image
+            const OverlayItem(this.text, this.title, this.index, this.size, this.pos);
+          }
+
+          TextStyle overlayStyle(bool title, [double scale = 1]) => TextStyle(
+                fontSize: (title ? kTitleSize : kCaptionSize) * scale,
+                fontWeight: title ? FontWeight.w800 : FontWeight.w500,
+                color: Colors.white,
+                height: 1.15,
+                shadows: [
+                  Shadow(
+                      blurRadius: 8 * scale,
+                      color: Colors.black.withValues(alpha: 0.85),
+                      offset: Offset(2 * scale, 2 * scale)),
+                ],
+              );
+
+          TextPainter _painter(String text, bool title) => TextPainter(
+                text: TextSpan(text: text, style: overlayStyle(title)),
+                textAlign: TextAlign.center,
+                textDirection: TextDirection.ltr,
+              )..layout(maxWidth: kTextMaxW);
+
+          Size _measure(String text, bool title) {
+            final tp = _painter(text, title);
+            return Size(tp.width.ceilToDouble() + 2 * kPad,
+                tp.height.ceilToDouble() + 2 * kPad);
+          }
+
+          /// Every title shares one spot. Captions sit right below the tallest title,
+          /// so they never move or overlap when titles change.
+          List<OverlayItem> layoutOverlay(
+              List<String> titles, List<String> captions, double ax, double ay) {
+            final ts = [for (final t in titles) _measure(t, true)];
+            final cs = [for (final c in captions) _measure(c, false)];
+            final titleH = ts.fold(0.0, (a, s) => max(a, s.height));
+            final capH = cs.fold(0.0, (a, s) => max(a, s.height));
+            final gap = ts.isNotEmpty && cs.isNotEmpty ? kGap : 0.0;
+            final blockH = titleH + gap + capH;
+            final top = (ay * kH).clamp(0.0, max(0.0, kH - blockH)).toDouble();
+
+            double left(Size s) =>
+                (ax * kW - s.width / 2).clamp(0.0, max(0.0, kW - s.width)).toDouble();
+
+            return [
+              for (var i = 0; i < titles.length; i++)
+                OverlayItem(titles[i], true, i, ts[i], Offset(left(ts[i]), top)),
+              for (var i = 0; i < captions.length; i++)
+                OverlayItem(captions[i], false, i, cs[i],
+                    Offset(left(cs[i]), top + titleH + gap)),
+            ];
+          }
+
+          /// Draws the text onto a transparent PNG using Flutter's own text engine,
+          /// so every script (including Malayalam) is shaped correctly.
+          Future<void> renderTextPng(OverlayItem it, String path) async {
+            final tp = _painter(it.text, it.title);
+            final rec = ui.PictureRecorder();
+            final canvas = Canvas(rec);
+            tp.paint(canvas, const Offset(kPad, kPad));
+            final image = await rec
+                .endRecording()
+                .toImage(it.size.width.toInt(), it.size.height.toInt());
+            final data = await image.toByteData(format: ui.ImageByteFormat.png);
+            await File(path).writeAsBytes(data!.buffer.asUint8List());
+          }
+          EOF_2
+          cat > lib/reel_maker.dart <<'EOF_3'
+          import 'dart:io';
+          import 'dart:math';
 
           import 'package:ffmpeg_kit_flutter_new/ffmpeg_kit.dart';
           import 'package:ffmpeg_kit_flutter_new/return_code.dart';
           import 'package:path_provider/path_provider.dart';
 
           import 'analyzer.dart';
+          import 'text_overlay.dart';
 
           typedef Progress = void Function(String message, double fraction);
 
@@ -237,19 +341,11 @@ jobs:
           const int outW = 1080;
           const int outH = 1920; // 9:16 for Reels / Shorts
           const int fps = 30;
-          const double transitionSecs = 0.5;
+          const double transitionSecs = 0.6;
           const double maxReelSecs = 60; // longest reel allowed
 
-          const _transitions = [
-            'fade',
-            'slideleft',
-            'circleopen',
-            'wipeleft',
-            'smoothleft',
-            'dissolve',
-            'zoomin',
-            'slideup',
-          ];
+          /// Soft, gentle blends only (no sliding or wiping).
+          const _transitions = ['fade', 'dissolve', 'fadegrays'];
 
           class ReelMaker {
             bool _useHardwareEncoder = false;
@@ -271,8 +367,11 @@ jobs:
               return false;
             }
 
+            String _t(double v) => v.toStringAsFixed(3);
+
             /// Full pipeline. Returns the path of the finished reel.
-            Future<String> make(List<String> clips, Progress onProgress) async {
+            Future<String> make(
+                List<String> clips, OverlayOptions? overlay, Progress onProgress) async {
               final tmp = await getTemporaryDirectory();
               final work = Directory('${tmp.path}/reel_work')..createSync(recursive: true);
               for (final f in work.listSync()) {
@@ -283,7 +382,7 @@ jobs:
               var segments = <Segment>[];
               for (var i = 0; i < clips.length; i++) {
                 onProgress('Analysing clip ${i + 1} of ${clips.length}…',
-                    0.05 + 0.25 * i / clips.length);
+                    0.05 + 0.20 * i / clips.length);
                 segments.addAll(await analyzeClip(clips[i], work, i));
               }
               if (segments.isEmpty) {
@@ -306,7 +405,7 @@ jobs:
               final durations = <double>[];
               for (var i = 0; i < segments.length; i++) {
                 onProgress('Enhancing part ${i + 1} of ${segments.length}…',
-                    0.30 + 0.45 * i / segments.length);
+                    0.25 + 0.40 * i / segments.length);
                 final s = segments[i];
                 final out = '${work.path}/part_$i.mp4';
                 final gain = ((target - s.brightness) / 255 * 0.5).clamp(-0.12, 0.12);
@@ -314,14 +413,14 @@ jobs:
                     'crop=$outW:$outH,setsar=1,fps=$fps,'
                     'eq=brightness=${gain.toStringAsFixed(3)}:contrast=1.08:saturation=1.18,'
                     'unsharp=5:5:0.5:5:5:0.0,format=yuv420p';
-                final d = s.duration.toStringAsFixed(3);
-                final fadeOut = (s.duration - 0.05).toStringAsFixed(3);
+                final d = _t(s.duration);
+                final fadeOut = _t(s.duration - 0.05);
                 final af = 'aresample=44100,aformat=channel_layouts=stereo,'
                     'afade=t=in:d=0.05,afade=t=out:st=$fadeOut:d=0.05';
 
                 final ok = await _run(() => [
                       '-y',
-                      '-ss', s.start.toStringAsFixed(3), '-t', d, '-i', s.clip,
+                      '-ss', _t(s.start), '-t', d, '-i', s.clip,
                       if (!s.hasAudio) ...[
                         '-f', 'lavfi', '-t', d, '-i', 'anullsrc=r=44100:cl=stereo',
                       ],
@@ -337,18 +436,19 @@ jobs:
                 durations.add(await probeDuration(out));
               }
 
-              // 5) Join with transitions.
-              final reel = '${tmp.path}/reel_${DateTime.now().millisecondsSinceEpoch}.mp4';
-              onProgress('Adding transitions…', 0.80);
+              // 5) Join with soft transitions.
+              final stamp = DateTime.now().millisecondsSinceEpoch;
+              final joined = '${work.path}/joined.mp4';
+              onProgress('Adding transitions…', 0.68);
               if (parts.length == 1) {
-                await File(parts.first).copy(reel);
+                await File(parts.first).copy(joined);
               } else {
                 final v = StringBuffer(), a = StringBuffer();
                 var merged = durations[0]; // length of everything joined so far
                 var vPrev = '0:v', aPrev = '0:a';
                 for (var i = 1; i < parts.length; i++) {
                   final t = transitionSecs;
-                  final offset = (merged - t).toStringAsFixed(3);
+                  final offset = _t(merged - t);
                   final vOut = i == parts.length - 1 ? 'vout' : 'v$i';
                   final aOut = i == parts.length - 1 ? 'aout' : 'a$i';
                   final name = _transitions[(i - 1) % _transitions.length];
@@ -368,18 +468,75 @@ jobs:
                       '-pix_fmt', 'yuv420p',
                       '-c:a', 'aac', '-b:a', '160k',
                       '-movflags', '+faststart',
-                      reel,
+                      joined,
                     ]);
                 if (!ok) throw Exception('Could not join the clips.');
+              }
+
+              // 6) Titles and captions (one at a time, soft fade + small rise).
+              final reel = '${tmp.path}/reel_$stamp.mp4';
+              if (overlay != null && !overlay.isEmpty) {
+                onProgress('Adding titles…', 0.85);
+                await _addText(joined, overlay, work, reel);
+              } else {
+                await File(joined).copy(reel);
               }
 
               onProgress('Done', 1.0);
               work.deleteSync(recursive: true);
               return reel;
             }
+
+            /// Each title/caption gets an equal share of the reel's length. Within its
+            /// share it fades in while rising slightly, then fades out, so changing
+            /// from one text to the next looks gentle.
+            Future<void> _addText(
+                String input, OverlayOptions o, Directory work, String out) async {
+              final total = await probeDuration(input);
+              final items = layoutOverlay(o.titles, o.captions, o.ax, o.ay);
+
+              final extra = <String>[];
+              final f = StringBuffer();
+              var cur = '0:v';
+              for (var k = 0; k < items.length; k++) {
+                final it = items[k];
+                final count = it.title ? o.titles.length : o.captions.length;
+                final slot = total / count;
+                final start = slot * it.index;
+                final end = start + slot;
+                final fd = min(0.4, slot / 3);
+                final png = '${work.path}/txt_$k.png';
+                await renderTextPng(it, png);
+
+                extra.addAll(['-loop', '1', '-framerate', '$fps', '-t', _t(slot), '-i', png]);
+                f.write('[${k + 1}:v]format=rgba,'
+                    'fade=t=in:st=0:d=${_t(fd)}:alpha=1,'
+                    'fade=t=out:st=${_t(slot - fd)}:d=${_t(fd)}:alpha=1,'
+                    'setpts=PTS+${_t(start)}/TB[o$k];');
+                f.write("[$cur][o$k]overlay=x=${it.pos.dx.round()}"
+                    ":y='${it.pos.dy.round()}+24*max(0,1-(t-${_t(start)})/${_t(fd)})'"
+                    ":eval=frame:enable='between(t,${_t(start)},${_t(end)})'[c$k];");
+                cur = 'c$k';
+              }
+              f.write('[$cur]format=yuv420p[vout]');
+
+              final ok = await _run(() => [
+                    '-y',
+                    '-i', input,
+                    ...extra,
+                    '-filter_complex', f.toString(),
+                    '-map', '[vout]', '-map', '0:a?',
+                    ..._videoEncoder(),
+                    '-pix_fmt', 'yuv420p',
+                    '-c:a', 'copy',
+                    '-movflags', '+faststart',
+                    out,
+                  ]);
+              if (!ok) throw Exception('Could not add titles.');
+            }
           }
-          EOF_2
-          cat > lib/main.dart <<'EOF_3'
+          EOF_3
+          cat > lib/main.dart <<'EOF_4'
           import 'dart:io';
 
           import 'package:flutter/material.dart';
@@ -388,6 +545,7 @@ jobs:
           import 'package:video_player/video_player.dart';
 
           import 'reel_maker.dart';
+          import 'text_overlay.dart';
 
           const int maxClips = 20;
 
@@ -418,6 +576,14 @@ jobs:
 
           class _HomeState extends State<Home> {
             final clips = <String>[];
+            final titles = <String>[];
+            final captions = <String>[];
+            final titleCtl = TextEditingController();
+            final captionCtl = TextEditingController();
+
+            /// Shared position of the text block (centre x, top y) as frame fractions.
+            double ax = 0.5, ay = 0.70;
+
             bool busy = false;
             String status = '';
             double progress = 0;
@@ -436,6 +602,13 @@ jobs:
               });
             }
 
+            void addText(List<String> list, TextEditingController c) {
+              final t = c.text.trim();
+              if (t.isEmpty) return;
+              setState(() => list.add(t));
+              c.clear();
+            }
+
             Future<void> make() async {
               setState(() {
                 busy = true;
@@ -445,11 +618,15 @@ jobs:
               await player?.dispose();
               player = null;
               try {
-                final path = await ReelMaker().make(clips, (m, f) {
-                  if (mounted) setState(() {
-                    status = m;
-                    progress = f;
-                  });
+                final opts = OverlayOptions(
+                    List.of(titles), List.of(captions), ax, ay);
+                final path = await ReelMaker().make(clips, opts, (m, f) {
+                  if (mounted) {
+                    setState(() {
+                      status = m;
+                      progress = f;
+                    });
+                  }
                 });
                 setState(() => status = 'Saving to gallery…');
                 await Gal.putVideo(path);
@@ -472,88 +649,204 @@ jobs:
             @override
             void dispose() {
               player?.dispose();
+              titleCtl.dispose();
+              captionCtl.dispose();
               super.dispose();
+            }
+
+            // ---------- UI pieces ----------
+
+            Widget section(String text) => Padding(
+                  padding: const EdgeInsets.only(top: 20, bottom: 8),
+                  child: Text(text, style: Theme.of(context).textTheme.titleMedium),
+                );
+
+            Widget textEditor(String hint, List<String> list, TextEditingController c) {
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(children: [
+                    Expanded(
+                      child: TextField(
+                        controller: c,
+                        enabled: !busy,
+                        decoration: InputDecoration(
+                          hintText: hint,
+                          border: const OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        onSubmitted: (_) => addText(list, c),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    IconButton.filled(
+                      onPressed: busy ? null : () => addText(list, c),
+                      icon: const Icon(Icons.add),
+                    ),
+                  ]),
+                  if (list.isNotEmpty)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Wrap(
+                        spacing: 8,
+                        runSpacing: 4,
+                        children: [
+                          for (var i = 0; i < list.length; i++)
+                            InputChip(
+                              label: Text('${i + 1}. ${list[i]}',
+                                  overflow: TextOverflow.ellipsis),
+                              onDeleted: busy ? null : () => setState(() => list.removeAt(i)),
+                            ),
+                        ],
+                      ),
+                    ),
+                ],
+              );
+            }
+
+            /// A small 9:16 frame. Drag anywhere in it to move the title+caption block.
+            Widget positionPicker() {
+              final tl = titles.isEmpty && captions.isEmpty ? ['Your title'] : titles;
+              final cl = titles.isEmpty && captions.isEmpty ? ['Your caption'] : captions;
+              return Center(
+                child: SizedBox(
+                  width: 200,
+                  child: AspectRatio(
+                    aspectRatio: kW / kH,
+                    child: LayoutBuilder(builder: (context, box) {
+                      final s = box.maxWidth / kW;
+                      final items = layoutOverlay(tl, cl, ax, ay);
+                      return GestureDetector(
+                        onPanUpdate: busy
+                            ? null
+                            : (d) => setState(() {
+                                  ax = (ax + d.delta.dx / box.maxWidth).clamp(0.0, 1.0).toDouble();
+                                  ay = (ay + d.delta.dy / box.maxHeight).clamp(0.0, 1.0).toDouble();
+                                }),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: Stack(children: [
+                            Positioned.fill(
+                              child: Container(
+                                color: Colors.black,
+                                alignment: Alignment.topCenter,
+                                padding: const EdgeInsets.only(top: 6),
+                                child: const Text('drag to position',
+                                    style: TextStyle(fontSize: 10, color: Colors.white38)),
+                              ),
+                            ),
+                            for (final it in items.where((i) => i.index == 0))
+                              Positioned(
+                                left: (it.pos.dx + kPad) * s,
+                                top: (it.pos.dy + kPad) * s,
+                                width: (it.size.width - 2 * kPad) * s,
+                                child: Text(it.text,
+                                    textAlign: TextAlign.center,
+                                    style: overlayStyle(it.title, s)),
+                              ),
+                          ]),
+                        ),
+                      );
+                    }),
+                  ),
+                ),
+              );
+            }
+
+            Widget clipList() {
+              if (clips.isEmpty) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12),
+                  child: Center(child: Text('Add any number of clips to start.')),
+                );
+              }
+              return ReorderableListView(
+                shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                onReorder: busy
+                    ? (_, __) {}
+                    : (a, b) => setState(() {
+                          if (b > a) b--;
+                          clips.insert(b, clips.removeAt(a));
+                        }),
+                children: [
+                  for (final c in clips)
+                    ListTile(
+                      key: ValueKey(c),
+                      dense: true,
+                      leading: const Icon(Icons.movie),
+                      title: Text(c.split('/').last, overflow: TextOverflow.ellipsis),
+                      trailing: IconButton(
+                        icon: const Icon(Icons.close),
+                        onPressed: busy ? null : () => setState(() => clips.remove(c)),
+                      ),
+                    ),
+                ],
+              );
             }
 
             @override
             Widget build(BuildContext context) {
               return Scaffold(
                 appBar: AppBar(title: const Text('Reel Maker')),
-                body: Padding(
+                body: ListView(
                   padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      Row(children: [
-                        Expanded(
-                          child: FilledButton.tonalIcon(
-                            onPressed: busy ? null : pick,
-                            icon: const Icon(Icons.video_library),
-                            label: Text('Add clips (${clips.length}/$maxClips)'),
-                          ),
+                  children: [
+                    Row(children: [
+                      Expanded(
+                        child: FilledButton.tonalIcon(
+                          onPressed: busy ? null : pick,
+                          icon: const Icon(Icons.video_library),
+                          label: Text('Add clips (${clips.length}/$maxClips)'),
                         ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: FilledButton.icon(
-                            onPressed: busy || clips.isEmpty ? null : make,
-                            icon: const Icon(Icons.auto_awesome),
-                            label: const Text('Make reel'),
-                          ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: FilledButton.icon(
+                          onPressed: busy || clips.isEmpty ? null : make,
+                          icon: const Icon(Icons.auto_awesome),
+                          label: const Text('Make reel'),
                         ),
-                      ]),
-                      const SizedBox(height: 12),
-                      if (busy) LinearProgressIndicator(value: progress),
-                      if (status.isNotEmpty)
-                        Padding(
-                          padding: const EdgeInsets.symmetric(vertical: 8),
-                          child: Text(status),
-                        ),
-                      if (player != null && output != null)
-                        Expanded(
-                          child: Center(
+                      ),
+                    ]),
+                    if (busy)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 12),
+                        child: LinearProgressIndicator(value: progress),
+                      ),
+                    if (status.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Text(status),
+                      ),
+                    if (player != null && output != null)
+                      Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 8),
+                        child: Center(
+                          child: SizedBox(
+                            height: 420,
                             child: AspectRatio(
                               aspectRatio: player!.value.aspectRatio,
                               child: VideoPlayer(player!),
                             ),
                           ),
-                        )
-                      else
-                        Expanded(
-                          child: clips.isEmpty
-                              ? const Center(
-                                  child: Text('Add any number of clips to start.'))
-                              : ReorderableListView(
-                                  onReorder: busy
-                                      ? (_, __) {}
-                                      : (a, b) => setState(() {
-                                            if (b > a) b--;
-                                            clips.insert(b, clips.removeAt(a));
-                                          }),
-                                  children: [
-                                    for (final c in clips)
-                                      ListTile(
-                                        key: ValueKey(c),
-                                        leading: const Icon(Icons.movie),
-                                        title: Text(c.split('/').last,
-                                            overflow: TextOverflow.ellipsis),
-                                        trailing: IconButton(
-                                          icon: const Icon(Icons.close),
-                                          onPressed: busy
-                                              ? null
-                                              : () => setState(() => clips.remove(c)),
-                                        ),
-                                      ),
-                                  ],
-                                ),
                         ),
-                    ],
-                  ),
+                      ),
+                    clipList(),
+                    section('Titles (shown one at a time)'),
+                    textEditor('Type a title, tap +', titles, titleCtl),
+                    section('Captions (shown below the title)'),
+                    textEditor('Type a caption, tap +', captions, captionCtl),
+                    section('Text position (same for all titles and captions)'),
+                    positionPicker(),
+                    const SizedBox(height: 24),
+                  ],
                 ),
               );
             }
           }
-          EOF_3
-          cat > setup.sh <<'EOF_4'
+          EOF_4
+          cat > setup.sh <<'EOF_5'
           #!/usr/bin/env bash
           # Run once, from inside the reel_maker folder, on a computer with Flutter installed.
           set -e
@@ -577,7 +870,7 @@ jobs:
 
           flutter pub get
           echo "Done. Connect your phone (USB debugging on) and run: flutter run --release"
-          EOF_4
+          EOF_5
       - name: Build
         working-directory: app
         run: |
