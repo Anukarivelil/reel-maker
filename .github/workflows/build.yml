@@ -356,13 +356,27 @@ jobs:
 
             /// Runs ffmpeg; if the software encoder is missing, retries once with
             /// Android's hardware H.264 encoder.
+            String lastLog = '';
+            int skippedParts = 0;
+
+            String _tail(String s) {
+              final lines = s.split('\n').where((l) => l.trim().isNotEmpty).toList();
+              return lines.skip(lines.length > 6 ? lines.length - 6 : 0).join('\n');
+            }
+
             Future<bool> _run(List<String> Function() args) async {
               var s = await FFmpegKit.executeWithArguments(args());
               if (ReturnCode.isSuccess(await s.getReturnCode())) return true;
-              if (!_useHardwareEncoder) {
+              final full = await s.getOutput() ?? '';
+              lastLog = _tail(full);
+              // Only switch to the hardware encoder if the software one is missing.
+              if (!_useHardwareEncoder &&
+                  (full.contains('Unknown encoder') ||
+                      full.contains('Encoder not found'))) {
                 _useHardwareEncoder = true;
                 s = await FFmpegKit.executeWithArguments(args());
-                return ReturnCode.isSuccess(await s.getReturnCode());
+                if (ReturnCode.isSuccess(await s.getReturnCode())) return true;
+                lastLog = _tail(await s.getOutput() ?? '');
               }
               return false;
             }
@@ -403,6 +417,8 @@ jobs:
               // 4) Re-encode each segment to the same size/fps with colour enhancement.
               final parts = <String>[];
               final durations = <double>[];
+              var failLog = '';
+              skippedParts = 0;
               for (var i = 0; i < segments.length; i++) {
                 onProgress('Enhancing part ${i + 1} of ${segments.length}…',
                     0.25 + 0.40 * i / segments.length);
@@ -418,22 +434,36 @@ jobs:
                 final af = 'aresample=44100,aformat=channel_layouts=stereo,'
                     'afade=t=in:d=0.05,afade=t=out:st=$fadeOut:d=0.05';
 
-                final ok = await _run(() => [
+                final simpleVf = 'scale=$outW:$outH:force_original_aspect_ratio=increase,'
+                    'crop=$outW:$outH,setsar=1,fps=$fps,format=yuv420p';
+                List<String> encodeArgs(String filter, bool keepAudio) => [
                       '-y',
                       '-ss', _t(s.start), '-t', d, '-i', s.clip,
-                      if (!s.hasAudio) ...[
+                      if (!keepAudio) ...[
                         '-f', 'lavfi', '-t', d, '-i', 'anullsrc=r=44100:cl=stereo',
                       ],
-                      '-vf', vf,
-                      if (s.hasAudio) ...['-af', af],
-                      if (!s.hasAudio) ...['-map', '0:v', '-map', '1:a', '-shortest'],
+                      '-vf', filter,
+                      if (keepAudio) ...['-af', af],
+                      '-map', '0:v:0',
+                      if (keepAudio) ...['-map', '0:a:0'] else ...['-map', '1:a:0', '-shortest'],
                       ..._videoEncoder(),
                       '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',
                       out,
-                    ]);
-                if (!ok) throw Exception('Could not process part ${i + 1}.');
+                    ];
+                // First try the full enhancement; if that fails, a plain safe version
+                // (silent audio); if that fails too, skip this part.
+                var ok = await _run(() => encodeArgs(vf, s.hasAudio));
+                if (!ok) ok = await _run(() => encodeArgs(simpleVf, false));
+                if (!ok) {
+                  skippedParts++;
+                  failLog = lastLog;
+                  continue;
+                }
                 parts.add(out);
                 durations.add(await probeDuration(out));
+              }
+              if (parts.isEmpty) {
+                throw Exception('Could not process any clip.\n$failLog');
               }
 
               // 5) Join with soft transitions.
@@ -620,7 +650,8 @@ jobs:
               try {
                 final opts = OverlayOptions(
                     List.of(titles), List.of(captions), ax, ay);
-                final path = await ReelMaker().make(clips, opts, (m, f) {
+                final maker = ReelMaker();
+                final path = await maker.make(clips, opts, (m, f) {
                   if (mounted) {
                     setState(() {
                       status = m;
@@ -637,7 +668,10 @@ jobs:
                 setState(() {
                   output = path;
                   player = c;
-                  status = 'Saved to your gallery ✔';
+                  status = 'Saved to your gallery ✔' +
+                      (maker.skippedParts > 0
+                          ? ' (skipped ${maker.skippedParts} unreadable part(s))'
+                          : '');
                 });
               } catch (e) {
                 setState(() => status = 'Error: $e');
